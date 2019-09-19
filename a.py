@@ -15,8 +15,8 @@ import aiohttp
 import aiofiles
 import multiprocessing
 import xml.etree.ElementTree as ET
-from optparse import OptionParser
-from datetime import datetime
+from argparse import ArgumentParser
+import datetime
 from tqdm import tqdm
 from tabulate import tabulate
 from aiojobs.aiohttp import spawn
@@ -102,19 +102,26 @@ def get_stream_multi_url(station_id):
     } for x in ET.fromstring(resp.content)]
 
 def into_tokyo_time(time_str):
-    return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")\
-                   .astimezone(pytz.timezone("Asia/Tokyo"))
+    day, time = time_str.split(" ")
+    h, m, s = time.split(":")
+    h, m, s = int(h), int(m), int(s)
+    det = datetime.timedelta(hours=h, minutes=m, seconds=s)
+    t = (datetime.datetime.strptime(day, "%Y-%m-%d") + det)\
+        .astimezone(pytz.timezone("Asia/Tokyo"))
+    print(t.strftime("%Y-%m-%d %H:%M:%S"))
+    rt = t - datetime.timedelta(hours=5)
+    print(rt.strftime("%Y-%m-%d %H:%M:%S"))
+    return t, t.strftime("%Y%m%d%H%M%S"), rt.strftime("%Y%m%d")
 
-def get_stations(tokyo):
-    resp = se.get("/".join([radiko, "v3/program/date",
-                            tokyo.strftime("%Y%m%d"),
-                            "{}.xml".format(area_id)]))
+def get_stations(date=None):
+    if date is not None:
+        resp = se.get("/".join([radiko, "v3/program/date", date, "{}.xml".format(area_id)]))
+    else:
+        resp = se.get("/".join([radiko_api, "program/now"]), params={"area_id": area_id})
     root = ET.fromstring(resp.content)
-    stations = [{
-        "id": x.attrib["id"],
-        "name": x.find("name").text,
-        "progs": next({
-            "date": y.find("date").text,
+    def programs(x):
+        return {
+            "date": x.find("date").text,
             "progs": [{
                 "ft": z.attrib["ft"],
                 "to": z.attrib["to"],
@@ -127,23 +134,36 @@ def get_stations(tokyo):
                 "pfm": z.find("pfm").text,
                 "info": z.find("info").text,
                 "url": z.find("url").text,
-            } for z in y.findall("prog")]
-        } for y in x.findall("progs"))
+            } for z in x.findall("prog")]
+        } if x is not None else None
+    def scd(x):
+        return programs(x.find("progs")) if x is not None else None
+    stations = [{
+        "id": x.attrib["id"],
+        "name": x.find("name").text,
+        "progs": programs(x.find("progs")),
+        "scd": scd(x.find("scd"))
     } for x in root.find("stations").findall("station")]
     return stations
 
-def get_program_by_start_time(station_id, tokyo):
-    stations = get_stations(tokyo)
-    ft = tokyo.strftime("%Y%m%d%H%M%S")
+def get_program_by_start_time(station_id, sec, date):
+    stations = get_stations(date)
     for x in (x for x in stations if x["id"] == station_id):
         for p in x["progs"]["progs"]:
-            # print(p["ft"])
-            if p["ft"] == ft:
+            if p["ft"] == sec:
                 return p
+
+    for x in (x for x in stations if x["id"] == station_id):
+        print(tabulate([[  
+            datetime.datetime.strptime(y["ft"], "%Y%m%d%H%M%S").strftime("%m-%d %H:%M"),
+            int(y["dur"]) / 60, y["title"]
+        ] for y in x["progs"]["progs"]], headers=["Since", "Duration(min)", "Title"]))
+        break
+    else:
+        raise Exception("station not found")
     raise Exception("program not found")
 
-def get_chunklist(station_id, tokyo):
-    prog = get_program_by_start_time(station_id, tokyo)
+def get_chunklist(station_id, prog):
     resp = se.post("/".join([radiko_api, "ts/playlist.m3u8"]), params={
         "station_id": station_id,
         "ft": prog["ft"],
@@ -152,42 +172,6 @@ def get_chunklist(station_id, tokyo):
     })
     resp = se.get(m3u8.loads(resp.text).playlists[0].uri)
     return [s.uri for s in m3u8.loads(resp.text).segments]
-
-def download_stream(station_id, nsecs, output):
-    stream_urls = get_stream_multi_url(station_id)
-    stream_url = next(x["url"] for x in stream_urls if x["areafree"]) # areaid
-    print(stream_url)
-    rtmpdump = subprocess.Popen([
-        "rtmpdump",
-        "--live", 
-        "-r", stream_url,
-        "--conn", 'S:""',
-        "--conn", 'S:""',
-        "--conn", 'S:""',
-        "--conn", "S:{}".format(auth_token),
-        "--swfVfy", radiko_player,
-        "--stop", "{}".format(nsecs),
-        "--timeout", "180",
-        "--flv", "-",
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # print(" ".join(rtmpdump.args))
-    # print(rtmpdump.returncode)
-    # print(rtmpdump.stderr.decode("utf8"))
-    ffmpeg = subprocess.Popen([
-        "ffmpeg",
-        "-i", "-",
-        "-vn",
-        # "-acodec", "copy",
-        # "/tmp/a.aac"
-        "-acodec", "libmp3lame",
-        "-ar", "44100",
-        "-ab", "64k",
-        "-ac", "2",
-        "-y",
-        output
-    ], stdin=rtmpdump.stdout, stderr=subprocess.PIPE)
-    rtmpdump.stdout.close()
-    out = ffmpeg.communicate()
 
 async def fetch_chunk(chunks, workdir, files):
     q = Queue()
@@ -262,29 +246,87 @@ def bulk_download(chunks, output):
         print("converting to mp3...")
         print("$ " + " ".join(args))
         proc = subprocess.run(args, stdout=subprocess.PIPE)
-        print("complete!")
+        print("download complete!! -> {}".format(os.path.abspath(output)))
         # print(proc.returncode)
     finally:
         shutil.rmtree(workdir)
 
+def download_stream(station_id, nsecs, output):
+    stream_urls = get_stream_multi_url(station_id)
+    stream_url = next(x["url"] for x in stream_urls if x["areafree"]) # areaid
+    print(stream_url)
+    rtmpdump = subprocess.Popen([
+        "rtmpdump",
+        "--live", 
+        "-r", stream_url,
+        "--conn", 'S:""',
+        "--conn", 'S:""',
+        "--conn", 'S:""',
+        "--conn", "S:{}".format(auth_token),
+        "--swfVfy", radiko_player,
+        "--stop", "{}".format(nsecs),
+        "--timeout", "180",
+        "--flv", "-",
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print("start streaming...")
+    print("$ " + " ".join(rtmpdump.args))
+    ffmpeg = subprocess.Popen([
+        "ffmpeg",
+        "-i", "-",
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-ar", "44100",
+        "-ab", "64k",
+        "-ac", "2",
+        "-hide_banner",
+        "-loglevel", "info",
+        "-y",
+        output
+    ], stdin=rtmpdump.stdout, stdout=subprocess.PIPE)
+    print("$ " + " ".join(ffmpeg.args))
+    rtmpdump.stdout.close()
+    out = ffmpeg.communicate()
+    print("stream complete!! -> {}".format(os.path.abspath(output)))
+        
 if __name__ == "__main__":
-    parser = OptionParser()
-    parser.add_option("-t", "--time", dest="nsecs", help="record time(sec)", default=10)
-    parser.add_option("-o", "--output", dest="output", help="output file", default="a.mp3")
-    parser.add_option("-s", "--station", dest="station_id", help="station id")
-    parser.add_option("-f", "--from", dest="start", help="rec start timestamp: Y-M-D H:M:S")
-    opts, args = parser.parse_args(sys.argv[1:])
+    parser = ArgumentParser()
+
+    parser.add_argument("tool", type=str, help="tool name: { rec, rec-live }")
     
-    auth_token, area_id, area = authorize()
-    with open("/tmp/a.swf", "wb") as f:
-        f.write(swf_player)
-    tokyo = into_tokyo_time(opts.start)
-    "2019-09-17 22:00:00"
-    print(tabulate([[
-        opts.station_id,
-        tokyo.strftime("%Y-%m-%d %H:%M:%S")
-    ]], headers=["Station", "Since(Tokyo)"]))
-    chunks = get_chunklist(opts.station_id, tokyo)
-    bulk_download(chunks, output=opts.output)
-    # download_stream("QRR", nsecs=opts.nsecs, output=opts.output)
+    parser.add_argument("-t", "--time", dest="nsecs", help="stream record time(sec)", default=60)
+    parser.add_argument("-o", "--output", dest="output", help="output file", default="a.mp3")
+    parser.add_argument("-s", "--station", dest="station_id", help="station id")
+    parser.add_argument("-f", "--from", dest="start", help="rec start timestamp: Y-M-D H:M:S")
+    args = parser.parse_args(sys.argv[1:])
+
+    if args.tool == "rec":
+        auth_token, area_id, area = authorize()
+        with open("/tmp/a.swf", "wb") as f:
+            f.write(swf_player)
+        tokyo, sec, date = into_tokyo_time(args.start)
+        # print(tokyo.strftime("%Y-%m-%d %H:%M:%S"))
+        "2019-09-17 22:00:00"
+        prog = get_program_by_start_time(args.station_id, sec, date)
+        print(tabulate([[
+            args.station_id,
+            tokyo.strftime("%Y-%m-%d %H:%M:%S"),
+            prog["title"]
+        ]], headers=["Station", "Since(Tokyo)", "Title"]))
+        chunks = get_chunklist(args.station_id, prog)
+        bulk_download(chunks, output=args.output)
+    elif args.tool == "rec-live":
+        auth_token, area_id, area = authorize()
+        print(tabulate([[
+            args.station_id,
+            args.nsecs,
+        ]], headers=["Station", "Duration(sec)"]))
+        download_stream(args.station_id, nsecs=args.nsecs, output=args.output)
+    elif args.tool == "list":
+        auth_token, area_id, area = authorize()
+        stations = get_stations()
+        print(tabulate([[  
+            x["id"], x["name"], x["scd"]["progs"][0]["title"]
+        ] for x in stations], headers=["Id", "Station", "Current"]))
+    else:
+        print("unknown tool name: {}".format(tool))
 
