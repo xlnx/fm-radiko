@@ -19,7 +19,6 @@ from argparse import ArgumentParser
 import datetime
 from tqdm import tqdm
 from tabulate import tabulate
-from aiojobs.aiohttp import spawn
 from queue import Queue, Empty
 
 MAX_PENDING = multiprocessing.cpu_count() * 4
@@ -101,13 +100,14 @@ def get_stream_multi_url(station_id):
         "url": x.text
     } for x in ET.fromstring(resp.content)]
 
-def into_tokyo_time(time_str):
+def into_tokyo_time(time_str, local=True):
     day, time = time_str.split(" ")
     h, m, s = time.split(":")
     h, m, s = int(h), int(m), int(s)
     det = datetime.timedelta(hours=h, minutes=m, seconds=s)
-    t = (datetime.datetime.strptime(day, "%Y-%m-%d") + det)\
-        .astimezone(pytz.timezone("Asia/Tokyo"))
+    t = datetime.datetime.strptime(day, "%Y-%m-%d") + det
+    if local:
+        t = t.astimezone(pytz.timezone("Asia/Tokyo"))
     print(t.strftime("%Y-%m-%d %H:%M:%S"))
     rt = t - datetime.timedelta(hours=5)
     print(rt.strftime("%Y-%m-%d %H:%M:%S"))
