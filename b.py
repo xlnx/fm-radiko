@@ -7,7 +7,9 @@ import m3u8
 import tempfile
 import shutil
 import subprocess
+import inquirer
 import dl
+from argparse import ArgumentParser
 
 se = requests.Session()
 prefix = "https://d3cfw2mckicdfw.cloudfront.net/4aaea307daf6beef6bf5ecb7b610e19efeb8dd5530"
@@ -38,7 +40,24 @@ def select_chunklist(pl):
         fps = x['frame_rate']
         return (-a*b, -fps, -bw)
     pl.sort(key=fn)
-    pl = pl[0]
+    choices = {
+        "res:{}x{} fps:{} {}".format(
+            e['resolution'][0],
+            e['resolution'][1],
+            e['frame_rate'],
+            e['video']
+        ): e
+        for e in pl
+    }
+    quests = [
+        inquirer.List(
+            'source',
+            message='select a m3u8 source:',
+            choices=choices.keys()
+        )
+    ]
+    ans = inquirer.prompt(quests)
+    pl = choices[ans['source']]
     a, b = pl['resolution']
     bw = pl['bandwidth']
     fps = pl['frame_rate']
@@ -49,47 +68,45 @@ def select_chunklist(pl):
     print("video: {}".format(pl['video']))
     return pl
 
-pl = get_playlist()
-cl = select_chunklist(pl)['url']
-chs = get_chunks(cl)
+if __name__ == "__main__":
 
-output = "a.mp4"
+    parser = ArgumentParser()
 
-workdir = tempfile.mkdtemp()
-try:
-    # chs = chs[0:10]
-    files = dl.download_chunks(chs, workdir)
-    lname = os.path.join(workdir, "chunk_list")
-    oname = os.path.join(workdir, "joint.ts")
-    print("indexing chunks")
-    with open(lname, "w") as f:
-        for fname in files:
-            f.write("file {}\n".format(os.path.abspath(fname)))
-    args = [
-        "ffmpeg",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", lname,
-        "-c", "copy",
-        "-y",
-        oname
-    ]
-    print("merging chunks...")
-    print("$ " + " ".join(args))
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    args = [
-        "ffmpeg",
-        "-i", oname,
-        "-c:v", "libx264",
-        "-crf", "0",
-        "-c:a", "copy",
-        output
-    ]
-    print("converting to mp4...")
-    print("$ " + " ".join(args))
-    proc = subprocess.run(args, stdout=subprocess.PIPE)
-finally:
-    shutil.rmtree(workdir)
+    parser.add_argument("-u", "--url", dest="url", help="url")
+    parser.add_argument("-o", "--output", dest="output", help="output file", default="a.ts")
+    args = parser.parse_args(sys.argv[1:])
+
+    prefix = args.url
+
+    pl = get_playlist()
+    cl = select_chunklist(pl)['url']
+    chs = get_chunks(cl)
+    
+    output = args.output
+    
+    workdir = tempfile.mkdtemp()
+    try:
+        files = dl.download_chunks(chs, workdir)
+        lname = os.path.join(workdir, "chunk_list")
+        # oname = os.path.join(workdir, "joint.ts")
+        print("indexing chunks")
+        with open(lname, "w") as f:
+            for fname in files:
+                f.write("file {}\n".format(os.path.abspath(fname)))
+        args = [
+            "ffmpeg",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", lname,
+            "-c", "copy",
+            "-y",
+            output
+        ]
+        print("merging chunks...")
+        print("$ " + " ".join(args))
+        proc = subprocess.run(args)
+    finally:
+        shutil.rmtree(workdir)
     
 # , headers={
 #     'Origin': 'https://www.openrec.tv',
