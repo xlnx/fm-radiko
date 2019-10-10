@@ -10,19 +10,11 @@ import m3u8
 import pytz
 import tempfile
 import shutil
-import asyncio
-import aiohttp
-import aiofiles
-import multiprocessing
 import xml.etree.ElementTree as ET
 from argparse import ArgumentParser
 import datetime
-from tqdm import tqdm
 from tabulate import tabulate
-from queue import Queue, Empty
-
-MAX_PENDING = multiprocessing.cpu_count() * 4
-MAX_RETRY = 20
+import dl
 
 radiko = "https://radiko.jp"
 radiko_player = "http://radiko.jp/apps/js/flash/myplayer-release.swf"
@@ -84,8 +76,10 @@ def authorize():
 
     # print(resp.status_code)
     # print(resp.text)
-    
-    aid, _, area = resp.text.strip().split(",")
+
+    resp = resp.text.strip()
+    print(resp)
+    aid, _, area = resp.split(",")
     if aid[0:2] != "JP":
         raise Exception("authorization failed: {}".format(aid))
     print("authorized: {}, {}, {}".format(aid, area, auth_token))
@@ -172,52 +166,17 @@ def get_chunklist(station_id, prog):
     })
     resp = se.get(m3u8.loads(resp.text).playlists[0].uri)
     return [s.uri for s in m3u8.loads(resp.text).segments]
-
-async def fetch_chunk(chunks, workdir, files):
-    q = Queue()
-    for e in chunks:
-        q.put_nowait(e)
-    lock = asyncio.Lock()
-    lbar = asyncio.Lock()
-    bar = tqdm(ncols=72, unit="p", total=len(chunks))
-    async def one_thread(s, i):
-        while True:
-            try:
-                async with lock:
-                    uri = q.get_nowait()
-                    _, name = os.path.split(uri)
-                    fname = os.path.join(workdir, name)
-                    files.put(fname)
-                for rep in range(0, MAX_RETRY):
-                    try:
-                        async with s.get(uri, timeout=10) as resp:
-                            async with aiofiles.open(fname, "wb") as f:
-                                await f.write(await resp.read())
-                        break
-                    except Exception as e:
-                        print("retry #{}: {}".format(rep, e))
-                async with lbar:
-                    bar.update(1)
-            except Empty:
-                return
-    async with aiohttp.ClientSession() as s:
-        await asyncio.gather(*[one_thread(s, i) \
-                               for i in range(0, MAX_PENDING)])
-    bar.close()
         
-def bulk_download(chunks, output):
+def bulk_download(chunks, output, preserve=False):
     workdir = tempfile.mkdtemp()
     try:
         print("downloading chunks...")
-        files = Queue()
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(fetch_chunk(chunks, workdir, files))
+        files = dl.download_chunks(chunks, workdir)
         lname = os.path.join(workdir, "aac_list")
-        oname = os.path.join(workdir, "joint.aac")
+        oname = os.path.join(workdir, "joint.aac") if not preserve else output
         print("indexing chunks...")
         with open(lname, "w") as f:
-            while not files.empty():
-                fname = files.get()
+            for fname in files:
                 f.write("file {}\n".format(os.path.abspath(fname)))
         args = [
             "ffmpeg",
@@ -232,20 +191,21 @@ def bulk_download(chunks, output):
         print("$ " + " ".join(args))
         proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # print(proc.returncode)
-        args = [
-            "ffmpeg",
-            "-i", oname,
-            "-c:a", "libmp3lame",
-            "-ac", "2",
-            "-q:a", "2",
-            "-hide_banner",
-            "-loglevel", "info",
-            "-y",
-            output
-        ]
-        print("converting to mp3...")
-        print("$ " + " ".join(args))
-        proc = subprocess.run(args, stdout=subprocess.PIPE)
+        if not preserve:
+            args = [
+                "ffmpeg",
+                "-i", oname,
+                "-c:a", "libmp3lame",
+                "-ac", "2",
+                "-q:a", "2",
+                "-hide_banner",
+                "-loglevel", "info",
+                "-y",
+                output
+            ]
+            print("converting to mp3...")
+            print("$ " + " ".join(args))
+            proc = subprocess.run(args, stdout=subprocess.PIPE)
         print("download complete!! -> {}".format(os.path.abspath(output)))
         # print(proc.returncode)
     finally:
@@ -297,6 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", dest="output", help="output file", default="a.mp3")
     parser.add_argument("-s", "--station", dest="station_id", help="station id")
     parser.add_argument("-f", "--from", dest="start", help="rec start timestamp: Y-M-D H:M:S")
+    parser.add_argument("-p", "--preserve", dest="preserve", help="preserve aac format")
     args = parser.parse_args(sys.argv[1:])
 
     if args.tool == "rec":
@@ -313,7 +274,7 @@ if __name__ == "__main__":
             prog["title"]
         ]], headers=["Station", "Since(Tokyo)", "Title"]))
         chunks = get_chunklist(args.station_id, prog)
-        bulk_download(chunks, output=args.output)
+        bulk_download(chunks, output=args.output, preserve=bool(args.preserve))
     elif args.tool == "rec-live":
         auth_token, area_id, area = authorize()
         print(tabulate([[
